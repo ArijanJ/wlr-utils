@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- Dependency refresh: egui/egui_glow 0.37, edgefirst-egl 0.35.
+
 ## 1.11.1 — 2026-10-07
 
 ### Fixed

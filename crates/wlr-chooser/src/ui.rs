@@ -1767,8 +1767,11 @@ impl App {
             .show(ui, |ui| {
                 for (i, rect) in &rects {
                     let s = vis[*i];
-                    let resp =
-                        ui.interact(*rect, ui.id().with(("expose", *i)), egui::Sense::click());
+                    let resp = ui.interact(
+                        *rect,
+                        ui.scope_id().with(("expose", *i)),
+                        egui::Sense::click(),
+                    );
                     // Per-tile ease-out, slightly delayed by index. Alt-Tab skips
                     // the intro entirely — every millisecond to first usable frame
                     // counts, so tiles appear at full size immediately.
@@ -1973,8 +1976,11 @@ impl App {
                     let x = row_left + i as f32 * (cw + gap);
                     let cell_rect =
                         egui::Rect::from_min_size(egui::pos2(x, row_y), egui::vec2(cw, cw));
-                    let resp =
-                        ui.interact(cell_rect, ui.id().with(("switch", i)), egui::Sense::click());
+                    let resp = ui.interact(
+                        cell_rect,
+                        ui.scope_id().with(("switch", i)),
+                        egui::Sense::click(),
+                    );
                     if resp.hovered() {
                         hovered = Some(i);
                     }

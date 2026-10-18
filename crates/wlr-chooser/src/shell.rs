@@ -985,6 +985,7 @@ impl PointerHandler for State {
                 PointerEventKind::Axis {
                     vertical,
                     horizontal,
+                    source,
                     ..
                 } => {
                     let delta = egui::vec2(-horizontal.absolute as f32, -vertical.absolute as f32);
@@ -992,6 +993,15 @@ impl PointerHandler for State {
                         unit: egui::MouseWheelUnit::Point,
                         delta,
                         phase: egui::TouchPhase::Move,
+                        source: match source {
+                            Some(
+                                wl_pointer::AxisSource::Wheel | wl_pointer::AxisSource::WheelTilt,
+                            ) => egui::MouseWheelSource::Wheel,
+                            Some(wl_pointer::AxisSource::Finger) => {
+                                egui::MouseWheelSource::Trackpad
+                            }
+                            _ => egui::MouseWheelSource::Unknown,
+                        },
                         modifiers: self.modifiers,
                     });
                 }
