@@ -88,9 +88,15 @@ pub fn main() {
 }
 
 /// Serve one request: run it as the front-end that asked.
-fn serve(host: &mut Host, tool: Tool, args: Vec<String>) -> Reply {
+fn serve(
+    host: &mut Host,
+    tool: Tool,
+    args: Vec<String>,
+    controls: &daemon::Controls,
+    wake: &std::os::fd::OwnedFd,
+) -> Reply {
     match tool {
-        Tool::Switch => crate::switcher_cli::serve(host, args),
+        Tool::Switch => crate::switcher_cli::serve(host, args, controls, wake),
         Tool::Choose => crate::chooser_cli::serve(host, args),
     }
 }

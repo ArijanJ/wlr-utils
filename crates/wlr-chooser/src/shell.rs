@@ -10,6 +10,7 @@
 //! ([`run`]) builds one, shows one overlay and drops it, while the switcher's daemon
 //! keeps one for the whole session and shows every overlay on it.
 
+use crate::daemon::{Control, Controls};
 use crate::ui::{App, Hold};
 use rustix::event::{PollFd, PollFlags, poll};
 use smithay_client_toolkit::{
@@ -275,7 +276,15 @@ impl Host {
     /// and it pings — and a connection left unread fills its buffer and wedges, so
     /// the two are waited on together rather than the socket alone.
     pub fn idle_until_readable(&mut self, other: BorrowedFd<'_>) -> anyhow::Result<()> {
-        while !wait(&mut self.queue, &mut self.state, &self.conn, Some(other))? {}
+        while !wait(
+            &mut self.queue,
+            &mut self.state,
+            &self.conn,
+            Some(other),
+            None,
+        )?
+        .0
+        {}
         Ok(())
     }
 
@@ -293,6 +302,18 @@ impl Host {
     /// then take it down and hand the host back for the next one. `t0` is the start
     /// of *this* overlay, for timing (see [`tlog`]).
     pub fn show(&mut self, app: App, t0: Instant) -> anyhow::Result<()> {
+        self.show_with_controls(app, t0, None)
+    }
+
+    /// Show an overlay while accepting compositor-driven cycle commands. The socket
+    /// thread cannot touch the Wayland/UI state, so it puts commands in `Controls` and
+    /// wakes this loop through the same eventfd it uses while idle.
+    pub fn show_with_controls(
+        &mut self,
+        app: App,
+        t0: Instant,
+        controls: Option<(BorrowedFd<'_>, &Controls)>,
+    ) -> anyhow::Result<()> {
         self.state.begin(app, t0, &self.queue.handle());
         // A commit with no buffer attached is what asks for a configure; the frame
         // painted in answer is what maps the surface.
@@ -302,12 +323,28 @@ impl Host {
         let requester = self.requester.take();
         while !self.state.closing() {
             let watched = requester.as_ref().map(|fd| fd.as_fd());
-            if wait(&mut self.queue, &mut self.state, &self.conn, watched)?
+            let control_fd = controls.as_ref().map(|(fd, _)| *fd);
+            let (requester_ready, control_ready) = wait(
+                &mut self.queue,
+                &mut self.state,
+                &self.conn,
+                watched,
+                control_fd,
+            )?;
+            if requester_ready
                 && let Some(fd) = watched
                 && hung_up(fd)
                 && let Some(app) = self.state.app.as_mut()
             {
                 app.cancel();
+            }
+            if control_ready && let Some((wake, queue)) = controls.as_ref() {
+                // The wake counter is only a level-trigger for both idle and active
+                // phases; draining it here prevents a spin when several invocations
+                // arrived together. Commands remain queued until sources exist.
+                let mut ticks = [0u8; 8];
+                let _ = rustix::io::read(wake, &mut ticks);
+                self.apply_controls(queue);
             }
         }
         self.state.end();
@@ -315,6 +352,19 @@ impl Host {
         // the window it picked, answering a client.
         self.queue.roundtrip(&mut self.state)?;
         Ok(())
+    }
+
+    fn apply_controls(&mut self, controls: &Controls) {
+        let Some(app) = self.state.app.as_mut() else {
+            return;
+        };
+        let mut pending = controls.lock().unwrap();
+        if !app.has_sources() {
+            return;
+        }
+        for control in pending.drain(..) {
+            app.cycle(matches!(control, Control::Next));
+        }
     }
 }
 
@@ -328,22 +378,31 @@ fn wait(
     state: &mut State,
     conn: &Connection,
     other: Option<BorrowedFd<'_>>,
-) -> anyhow::Result<bool> {
+    control: Option<BorrowedFd<'_>>,
+) -> anyhow::Result<(bool, bool)> {
     queue.dispatch_pending(state)?;
     queue.flush()?;
     // `None` means events arrived between the dispatch and here: go round and hand
     // them over before sleeping.
     let Some(guard) = queue.prepare_read() else {
-        return Ok(false);
+        return Ok((false, false));
     };
     let wayland = conn.as_fd();
     let mut fds = vec![PollFd::new(&wayland, PollFlags::IN)];
     if let Some(other) = other.as_ref() {
         fds.push(PollFd::new(other, PollFlags::IN));
     }
+    if let Some(control) = control.as_ref() {
+        fds.push(PollFd::new(control, PollFlags::IN));
+    }
     poll(&mut fds, None)?;
     let wayland_ready = !fds[0].revents().is_empty();
-    let other_ready = fds.get(1).is_some_and(|fd| !fd.revents().is_empty());
+    let other_ready = other.is_some() && fds.get(1).is_some_and(|fd| !fd.revents().is_empty());
+    let control_index = 1 + usize::from(other.is_some());
+    let control_ready = control.is_some()
+        && fds
+            .get(control_index)
+            .is_some_and(|fd| !fd.revents().is_empty());
     if wayland_ready {
         // Also how a host learns the compositor is gone: the read fails and the
         // error takes it down, rather than leaving it on a dead connection.
@@ -351,7 +410,7 @@ fn wait(
     } else {
         drop(guard);
     }
-    Ok(other_ready)
+    Ok((other_ready, control_ready))
 }
 
 /// Whether the peer of a readable socket has gone. A requester says everything it

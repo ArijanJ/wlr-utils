@@ -263,7 +263,7 @@ pub fn main() {
         None => return,
     };
 
-    match run(cli, t0, None) {
+    match run(cli, t0, None, None) {
         Ok(Ran::Switched) => {}
         Ok(Ran::Cancelled) => std::process::exit(1),
         Err(reason) => crate::exit_with(reason),
@@ -314,7 +314,12 @@ fn daemon_can_serve(cli: &Cli, args: &[String]) -> bool {
 /// `host` is the daemon's warm host, or `None` to build one for this run alone.
 /// Refusals come back as a message rather than exiting the process: the daemon has to
 /// send them to the client that asked instead of dying on them.
-fn run(cli: Cli, t0: Instant, host: Option<&mut shell::Host>) -> Result<Ran, String> {
+fn run(
+    cli: Cli,
+    t0: Instant,
+    host: Option<&mut shell::Host>,
+    controls: Option<(&daemon::Controls, &std::os::fd::OwnedFd)>,
+) -> Result<Ran, String> {
     crate::reject_hints_on_card(cli.hints, cli.layout)?;
 
     let view = View::from(cli.layout);
@@ -342,9 +347,12 @@ fn run(cli: Cli, t0: Instant, host: Option<&mut shell::Host>) -> Result<Ran, Str
     }
     preflight(&mut opts)?;
 
-    let picked = match host {
-        Some(host) => crate::run_overlay_on(host, opts, t0),
-        None => run_overlay(opts, t0),
+    let picked = match (host, controls) {
+        (Some(host), Some((controls, wake))) => {
+            crate::run_overlay_on_controlled(host, opts, t0, controls, wake)
+        }
+        (Some(host), _) => crate::run_overlay_on(host, opts, t0),
+        (None, _) => run_overlay(opts, t0),
     }
     .map_err(|e| tr!("error", error = format!("{e:#}")))?;
 
@@ -450,7 +458,12 @@ fn preflight(opts: &mut Options) -> Result<(), String> {
 ///
 /// The arguments are parsed with the very same parser the client used, so a daemon
 /// run and a direct run differ in nothing but what they had to build first.
-pub(crate) fn serve(host: &mut shell::Host, args: Vec<String>) -> daemon::Reply {
+pub(crate) fn serve(
+    host: &mut shell::Host,
+    args: Vec<String>,
+    controls: &daemon::Controls,
+    wake: &std::os::fd::OwnedFd,
+) -> daemon::Reply {
     // This overlay's clock starts here — a few hundred microseconds after the
     // invocation's own, which is all the client spent reaching us.
     let t0 = Instant::now();
@@ -468,7 +481,7 @@ pub(crate) fn serve(host: &mut shell::Host, args: Vec<String>) -> daemon::Reply 
     let Some(_lock) = acquire_switch_lock() else {
         return daemon::Reply::Busy;
     };
-    match run(cli, t0, Some(host)) {
+    match run(cli, t0, Some(host), Some((controls, wake))) {
         // The switcher acts on the pick rather than naming it, so there is nothing
         // for the client to print.
         Ok(Ran::Switched) => daemon::Reply::Done(String::new()),

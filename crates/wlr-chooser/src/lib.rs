@@ -14,6 +14,7 @@ pub mod shell;
 pub mod switcher_cli;
 pub mod ui;
 
+use std::os::fd::AsFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
@@ -225,6 +226,20 @@ pub fn run_overlay_on(
     let (app, out) = build_overlay(opts, t0);
     shell::tlog(t0, "ui ready, entering overlay");
     host.show(app, t0)?;
+    Ok(out.lock().unwrap().take())
+}
+
+/// As [`run_overlay_on`], but also accepts daemon control requests while visible.
+pub fn run_overlay_on_controlled(
+    host: &mut shell::Host,
+    opts: ui::Options,
+    t0: Instant,
+    controls: &crate::daemon::Controls,
+    wake: &std::os::fd::OwnedFd,
+) -> anyhow::Result<Option<ui::Selection>> {
+    let (app, out) = build_overlay(opts, t0);
+    shell::tlog(t0, "ui ready, entering overlay");
+    host.show_with_controls(app, t0, Some((wake.as_fd(), controls)))?;
     Ok(out.lock().unwrap().take())
 }
 

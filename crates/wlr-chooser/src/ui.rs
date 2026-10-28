@@ -1271,6 +1271,12 @@ impl App {
         self.cycle
     }
 
+    /// Whether the first source list has arrived. External cycle commands wait for
+    /// this instead of being lost while capture is still enumerating.
+    pub fn has_sources(&self) -> bool {
+        self.sources.is_some()
+    }
+
     /// Advance (or retreat) the highlighted source.
     pub fn cycle(&mut self, forward: bool) {
         let n = self.visible().len();

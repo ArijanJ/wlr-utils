@@ -24,12 +24,16 @@
 
 use crate::shell::{Host, tlog};
 use rustix::event::{EventfdFlags, eventfd};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Sender},
+};
 use std::time::{Duration, Instant};
 
 /// Separates the arguments inside a `show` line.
@@ -79,6 +83,16 @@ enum Request {
     /// Stop the daemon.
     Quit,
 }
+
+/// A request which arrived while the switcher overlay was already visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Control {
+    Next,
+    Previous,
+}
+
+/// Shared, bounded-by-use queue between the socket thread and the Wayland thread.
+pub type Controls = Arc<Mutex<VecDeque<Control>>>;
 
 impl Request {
     fn parse(line: &str) -> Result<Request, String> {
@@ -220,7 +234,7 @@ static SHOWING: AtomicBool = AtomicBool::new(false);
 /// from this thread, so an overlay is up exactly while it runs.
 pub fn run(
     t0: Instant,
-    mut show: impl FnMut(&mut Host, Tool, Vec<String>) -> Reply,
+    mut show: impl FnMut(&mut Host, Tool, Vec<String>, &Controls, &OwnedFd) -> Reply,
 ) -> anyhow::Result<()> {
     let listener = bind()?;
     let mut host = Host::new()?;
@@ -250,7 +264,7 @@ fn bind() -> anyhow::Result<UnixListener> {
 fn serve(
     listener: UnixListener,
     host: &mut Host,
-    show: &mut impl FnMut(&mut Host, Tool, Vec<String>) -> Reply,
+    show: &mut impl FnMut(&mut Host, Tool, Vec<String>, &Controls, &OwnedFd) -> Reply,
 ) -> anyhow::Result<()> {
     // Accepting has to keep working while the main thread is busy holding an overlay
     // — that is where `busy` answers come from — so it runs on its own thread and
@@ -259,7 +273,9 @@ fn serve(
     let (tx, rx) = mpsc::channel::<(Request, UnixStream)>();
     let wake = eventfd(0, EventfdFlags::empty())?;
     let thread_wake = wake.try_clone()?;
-    std::thread::spawn(move || accept_loop(listener, &tx, &thread_wake));
+    let controls: Controls = Arc::new(Mutex::new(VecDeque::new()));
+    let thread_controls = controls.clone();
+    std::thread::spawn(move || accept_loop(listener, &tx, &thread_wake, &thread_controls));
 
     loop {
         // Idle: nothing of ours is on screen, and the only thing worth waking for is
@@ -278,11 +294,14 @@ fn serve(
                     return Ok(());
                 }
                 Request::Run(tool, args) => {
+                    // The accept thread marks the run active before handing it over;
+                    // otherwise a second compositor invocation can slip into `tx`
+                    // before the Wayland thread has started the overlay.
                     SHOWING.store(true, Ordering::Relaxed);
                     // A client killed while its overlay is up leaves no one to answer:
                     // the overlay goes with it instead of holding the keyboard.
                     host.cancel_on_hangup(stream.try_clone().ok().map(OwnedFd::from));
-                    let reply = show(host, tool, args);
+                    let reply = show(host, tool, args, &controls, &wake);
                     host.cancel_on_hangup(None);
                     // Whatever slipped into the queue in the moment before the flag
                     // went up was a keybinding pressed twice, not a second picker.
@@ -293,6 +312,7 @@ fn serve(
                     while let Ok((_, mut queued)) = rx.try_recv() {
                         answer(&mut queued, &Reply::Busy);
                     }
+                    controls.lock().unwrap().clear();
                     SHOWING.store(false, Ordering::Relaxed);
                     answer(&mut stream, &reply);
                 }
@@ -303,7 +323,12 @@ fn serve(
 
 /// Accept clients and read their requests, answering the ones that need no overlay
 /// and handing the rest to the main thread.
-fn accept_loop(listener: UnixListener, tx: &Sender<(Request, UnixStream)>, wake: &OwnedFd) {
+fn accept_loop(
+    listener: UnixListener,
+    tx: &Sender<(Request, UnixStream)>,
+    wake: &OwnedFd,
+    controls: &Controls,
+) {
     for conn in listener.incoming() {
         let Ok(mut stream) = conn else { continue };
         let request = match read_request(&mut stream) {
@@ -317,12 +342,32 @@ fn accept_loop(listener: UnixListener, tx: &Sender<(Request, UnixStream)>, wake:
         // something about it: the switcher shrugs — pressing the keybinding twice
         // has always been a no-op — and the chooser shows its own overlay rather
         // than answer the portal nothing.
-        if SHOWING.load(Ordering::Relaxed) && matches!(request, Request::Run(..)) {
-            answer(&mut stream, &Reply::Busy);
+        if SHOWING.load(Ordering::Relaxed) {
+            if matches!(request, Request::Run(Tool::Switch, _)) {
+                // The compositor binding invokes the same plain command every time.
+                // Answer immediately, and wake the Wayland thread which owns App.
+                controls.lock().unwrap().push_back(Control::Next);
+                let _ = rustix::io::write(wake, &1u64.to_ne_bytes());
+                answer(&mut stream, &Reply::Done(String::new()));
+            } else if matches!(request, Request::Run(..)) {
+                answer(&mut stream, &Reply::Busy);
+            } else {
+                // ping/quit retain their ordinary semantics while an overlay is up.
+                if tx.send((request, stream)).is_err() {
+                    return;
+                }
+                let _ = rustix::io::write(wake, &1u64.to_ne_bytes());
+            }
             continue;
         }
+        let starts_overlay = matches!(request, Request::Run(..));
         if tx.send((request, stream)).is_err() {
             return; // the main loop is gone
+        }
+        if starts_overlay {
+            // Publish the active state before the request reaches the Wayland
+            // thread, closing the startup race with a repeated global binding.
+            SHOWING.store(true, Ordering::Relaxed);
         }
         let _ = rustix::io::write(wake, &1u64.to_ne_bytes());
     }
@@ -416,6 +461,19 @@ mod tests {
         assert_eq!(
             Reply::parse(&reply.to_line()),
             Reply::Err("first line second line".into())
+        );
+    }
+
+    #[test]
+    fn queued_controls_keep_every_plain_switch_invocation() {
+        let controls: Controls = Arc::new(Mutex::new(VecDeque::new()));
+        controls
+            .lock()
+            .unwrap()
+            .extend([Control::Next, Control::Next, Control::Previous]);
+        assert_eq!(
+            controls.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            vec![Control::Next, Control::Next, Control::Previous]
         );
     }
 }
